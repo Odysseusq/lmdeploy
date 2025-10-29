@@ -231,4 +231,8 @@ MODULE_MAP.update({
     'SDARMoeForCausalLM': f'{LMDEPLOY_PYTORCH_MODEL_PATH}.sdar_moe.SDARMoeForCausalLM',
 })
 
+MODULE_MAP.update({
+    'Qwen3NextForCausalLM': f'{LMDEPLOY_PYTORCH_MODEL_PATH}.qwen3_next.Qwen3NextForCausalLM',
+})
+
 CUSTOM_MODULE_MAP = dict()
