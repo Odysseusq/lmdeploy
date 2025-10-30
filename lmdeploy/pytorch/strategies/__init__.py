@@ -12,5 +12,8 @@ def build_strategy_factory(model_config: ModelConfig, misc_config: MiscConfig):
     elif model_paradigm == 'dllm':
         from .dllm import DLLMStrategyFactory
         return DLLMStrategyFactory(model_config=model_config, dllm_config=misc_config.dllm_config)
+    elif model_paradigm == 'next_dllm':
+        from .next_dllm import NextDLLMStrategyFactory
+        return NextDLLMStrategyFactory(model_config=model_config, next_dllm_config=misc_config.dllm_config)
     else:
         raise RuntimeError(f'Unsupported model paradigm: {model_paradigm}')
