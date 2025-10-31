@@ -51,7 +51,7 @@ class SDARMoeAttention(nn.Module):
             num_kv_heads=num_key_value_heads,
             v_head_size=head_dim,
             sliding_window=config.sliding_window,
-            block_sparse_size=dllm_block_length,
+            # block_sparse_size=dllm_block_length,
         )
 
         # o_proj

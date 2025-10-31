@@ -81,10 +81,11 @@ class TritonAttentionImpl(AttentionImpl[TritonAttentionMetadata]):
         assert not (alibi and not causal)
 
         from lmdeploy.pytorch.kernels.cuda import (alibi_paged_attention_fwd, fill_kv_cache, flash_attention_fwd,
-                                                   flatten_kv_cache, paged_attention_fwd)
+                                                   flatten_kv_cache, paged_attention_fwd, paged_attention_fwd_causal)
 
         self.fill_kv_cache = fill_kv_cache
         self.paged_attention_fwd = paged_attention_fwd
+        self.paged_attention_fwd_causal = paged_attention_fwd_causal
         self.alibi_paged_attention_fwd = alibi_paged_attention_fwd
         self.flatten_kv_cache = flatten_kv_cache
         self.flash_attention_fwd = flash_attention_fwd
@@ -170,7 +171,235 @@ class TritonAttentionImpl(AttentionImpl[TritonAttentionMetadata]):
             return attn_output
 
         if is_decoding:
-            self.paged_attention_fwd(
+            # def eager_attention_forward_causal():
+            #     """Eager attention forward as reference implementation for paged_attention_fwd.
+                
+            #     Supports multiple tokens per request in decoding phase.
+            #     Within a block (same request), uses causal (unidirectional) attention.
+            #     All tokens can attend to previous context tokens.
+            #     """
+            #     import math
+            #     # query shape: [num_tokens, num_heads, head_dim]
+            #     # k_cache, v_cache shape: [num_blocks, block_size, num_kv_heads, head_dim]
+                
+            #     num_tokens = query.size(0)
+            #     num_heads = query.size(1)
+            #     head_dim = query.size(2)
+            #     num_kv_heads = k_cache.size(2)
+            #     block_size = k_cache.size(1)
+                
+            #     # Group query attention: repeat kv heads to match query heads
+            #     num_queries_per_kv = num_heads // num_kv_heads
+                
+            #     # Determine request boundaries from q_start_loc and q_seqlens
+            #     # q_start_loc: starting position of each request in the batch
+            #     # q_seqlens: number of query tokens for each request
+            #     num_requests = len(q_seqlens)
+                
+            #     outputs = []
+                
+            #     # Process each request
+            #     for req_idx in range(num_requests):
+            #         req_start = q_start_loc[req_idx].item()
+            #         req_num_query_tokens = q_seqlens[req_idx].item()
+            #         req_end = req_start + req_num_query_tokens
+                    
+            #         # Extract query tokens for this request
+            #         q = query[req_start:req_end]  # [req_num_query_tokens, num_heads, head_dim]
+                    
+            #         # Get KV sequence length for this request
+            #         kv_seq_len = kv_seqlens[req_idx].item()
+                    
+            #         # Extract K and V from paged cache for this request
+            #         req_block_offsets = block_offsets[req_idx]  # [num_blocks_per_seq]
+            #         num_blocks = (kv_seq_len + block_size - 1) // block_size
+                    
+            #         # Gather K and V
+            #         k_list = []
+            #         v_list = []
+            #         for block_idx in range(num_blocks):
+            #             block_id = req_block_offsets[block_idx].item()
+            #             k_block = k_cache[block_id]  # [block_size, num_kv_heads, head_dim]
+            #             v_block = v_cache[block_id]  # [block_size, num_kv_heads, head_dim or v_head_dim]
+            #             k_list.append(k_block)
+            #             v_list.append(v_block)
+                    
+            #         k = torch.cat(k_list, dim=0)[:kv_seq_len]  # [kv_seq_len, num_kv_heads, head_dim]
+            #         v = torch.cat(v_list, dim=0)[:kv_seq_len]  # [kv_seq_len, num_kv_heads, v_head_dim]
+                    
+            #         # Reshape for group query attention
+            #         k = k.unsqueeze(2).expand(-1, -1, num_queries_per_kv, -1)
+            #         k = k.reshape(kv_seq_len, num_heads, head_dim)
+                    
+            #         v = v.unsqueeze(2).expand(-1, -1, num_queries_per_kv, -1)
+            #         v = v.reshape(kv_seq_len, num_heads, self.v_head_size)
+                    
+            #         # Transpose for batched matmul
+            #         # q: [req_num_query_tokens, num_heads, head_dim] -> [num_heads, req_num_query_tokens, head_dim]
+            #         # k: [kv_seq_len, num_heads, head_dim] -> [num_heads, head_dim, kv_seq_len]
+            #         # v: [kv_seq_len, num_heads, v_head_dim] -> [num_heads, kv_seq_len, v_head_dim]
+            #         q_t = q.transpose(0, 1)  # [num_heads, req_num_query_tokens, head_dim]
+            #         k_t = k.permute(1, 2, 0)  # [num_heads, head_dim, kv_seq_len]
+            #         v_t = v.transpose(0, 1)  # [num_heads, kv_seq_len, v_head_dim]
+                    
+            #         # Compute attention scores: Q @ K^T
+            #         scale = self.scale if self.scale is not None else (1.0 / math.sqrt(head_dim))
+            #         scores = torch.matmul(q_t, k_t) * scale  # [num_heads, req_num_query_tokens, kv_seq_len]
+                    
+            #         # Create attention mask for causal attention (unidirectional)
+            #         # Current block: last req_num_query_tokens in the kv_seq_len
+            #         # Previous tokens: first (kv_seq_len - req_num_query_tokens) tokens
+            #         prev_context_len = kv_seq_len - req_num_query_tokens
+                    
+            #         # Create causal mask
+            #         # Initialize with -inf to mask all positions
+            #         mask = torch.full((req_num_query_tokens, kv_seq_len), 
+            #                          float('-inf'), dtype=scores.dtype, device=scores.device)
+                    
+            #         # Previous context: all query tokens can attend to all previous context tokens
+            #         if prev_context_len > 0:
+            #             mask[:, :prev_context_len] = 0  # No masking for previous context
+                    
+            #         # Current block: causal (unidirectional) attention
+            #         # Query token i can only attend to tokens 0 to i in the current block
+            #         for q_idx in range(req_num_query_tokens):
+            #             # Token q_idx can attend to tokens 0 to q_idx (inclusive) in current block
+            #             mask[q_idx, prev_context_len:prev_context_len + q_idx + 1] = 0
+                    
+            #         # Apply mask to scores
+            #         # Expand mask to match scores shape: [num_heads, req_num_query_tokens, kv_seq_len]
+            #         mask = mask.unsqueeze(0)  # [1, req_num_query_tokens, kv_seq_len]
+            #         scores = scores + mask  # Broadcasting over num_heads dimension
+                    
+            #         # Softmax
+            #         attn_weights = torch.softmax(scores, dim=-1)  # [num_heads, req_num_query_tokens, kv_seq_len]
+                    
+            #         # Compute output: attn_weights @ V
+            #         output = torch.matmul(attn_weights, v_t)  # [num_heads, req_num_query_tokens, v_head_dim]
+            #         output = output.transpose(0, 1)  # [req_num_query_tokens, num_heads, v_head_dim]
+            #         outputs.append(output)
+                
+            #     # Concatenate outputs from all requests
+            #     eager_output = torch.cat(outputs, dim=0)  # [num_tokens, num_heads, v_head_dim]
+            #     return eager_output
+            
+            # def eager_attention_forward_noncausal():
+            #     """Eager attention forward as reference implementation for paged_attention_fwd.
+                
+            #     Supports multiple tokens per request in decoding phase.
+            #     Within a block (same request), uses bidirectional attention.
+            #     Across different blocks/requests, uses causal attention.
+            #     """
+            #     import math
+            #     # query shape: [num_tokens, num_heads, head_dim]
+            #     # k_cache, v_cache shape: [num_blocks, block_size, num_kv_heads, head_dim]
+                
+            #     num_tokens = query.size(0)
+            #     num_heads = query.size(1)
+            #     head_dim = query.size(2)
+            #     num_kv_heads = k_cache.size(2)
+            #     block_size = k_cache.size(1)
+                
+            #     # Group query attention: repeat kv heads to match query heads
+            #     num_queries_per_kv = num_heads // num_kv_heads
+                
+            #     # Determine request boundaries from q_start_loc and q_seqlens
+            #     # q_start_loc: starting position of each request in the batch
+            #     # q_seqlens: number of query tokens for each request
+            #     num_requests = len(q_seqlens)
+                
+            #     outputs = []
+                
+            #     # Process each request
+            #     for req_idx in range(num_requests):
+            #         req_start = q_start_loc[req_idx].item()
+            #         req_num_query_tokens = q_seqlens[req_idx].item()
+            #         req_end = req_start + req_num_query_tokens
+                    
+            #         # Extract query tokens for this request
+            #         q = query[req_start:req_end]  # [req_num_query_tokens, num_heads, head_dim]
+                    
+            #         # Get KV sequence length for this request
+            #         kv_seq_len = kv_seqlens[req_idx].item()
+                    
+            #         # Extract K and V from paged cache for this request
+            #         req_block_offsets = block_offsets[req_idx]  # [num_blocks_per_seq]
+            #         num_blocks = (kv_seq_len + block_size - 1) // block_size
+                    
+            #         # Gather K and V
+            #         k_list = []
+            #         v_list = []
+            #         for block_idx in range(num_blocks):
+            #             block_id = req_block_offsets[block_idx].item()
+            #             k_block = k_cache[block_id]  # [block_size, num_kv_heads, head_dim]
+            #             v_block = v_cache[block_id]  # [block_size, num_kv_heads, head_dim or v_head_dim]
+            #             k_list.append(k_block)
+            #             v_list.append(v_block)
+                    
+            #         k = torch.cat(k_list, dim=0)[:kv_seq_len]  # [kv_seq_len, num_kv_heads, head_dim]
+            #         v = torch.cat(v_list, dim=0)[:kv_seq_len]  # [kv_seq_len, num_kv_heads, v_head_dim]
+                    
+            #         # Reshape for group query attention
+            #         k = k.unsqueeze(2).expand(-1, -1, num_queries_per_kv, -1)
+            #         k = k.reshape(kv_seq_len, num_heads, head_dim)
+                    
+            #         v = v.unsqueeze(2).expand(-1, -1, num_queries_per_kv, -1)
+            #         v = v.reshape(kv_seq_len, num_heads, self.v_head_size)
+                    
+            #         # Transpose for batched matmul
+            #         # q: [req_num_query_tokens, num_heads, head_dim] -> [num_heads, req_num_query_tokens, head_dim]
+            #         # k: [kv_seq_len, num_heads, head_dim] -> [num_heads, head_dim, kv_seq_len]
+            #         # v: [kv_seq_len, num_heads, v_head_dim] -> [num_heads, kv_seq_len, v_head_dim]
+            #         q_t = q.transpose(0, 1)  # [num_heads, req_num_query_tokens, head_dim]
+            #         k_t = k.permute(1, 2, 0)  # [num_heads, head_dim, kv_seq_len]
+            #         v_t = v.transpose(0, 1)  # [num_heads, kv_seq_len, v_head_dim]
+                    
+            #         # Compute attention scores: Q @ K^T
+            #         scale = self.scale if self.scale is not None else (1.0 / math.sqrt(head_dim))
+            #         scores = torch.matmul(q_t, k_t) * scale  # [num_heads, req_num_query_tokens, kv_seq_len]
+                    
+            #         # Create attention mask for bidirectional attention within the current block
+            #         # and causal attention for previous tokens
+            #         # Current block: last req_num_query_tokens in the kv_seq_len
+            #         # Previous tokens: first (kv_seq_len - req_num_query_tokens) tokens
+            #         mask = torch.zeros((req_num_query_tokens, kv_seq_len), 
+            #                           dtype=scores.dtype, device=scores.device)
+                    
+            #         # Previous context: causal attention from all query tokens
+            #         prev_context_len = kv_seq_len - req_num_query_tokens
+            #         if prev_context_len > 0:
+            #             # All query tokens can attend to all previous context tokens
+            #             mask[:, :prev_context_len] = 0  # No masking for previous context
+                    
+            #         # Current block: bidirectional attention
+            #         # Each query token can attend to all tokens in the current block
+            #         for q_idx in range(req_num_query_tokens):
+            #             # Bidirectional attention within current block
+            #             mask[q_idx, prev_context_len:] = 0  # No masking within block
+                    
+            #         # Apply mask to scores (mask with -inf for positions that should not be attended)
+            #         # Since we want no masking (bidirectional), we don't need to apply mask
+            #         # But if we want causal within block, we would create a causal mask
+                    
+            #         # For now, bidirectional within block means no additional masking needed
+            #         # The mask is already all zeros which means no masking
+                    
+            #         # Softmax
+            #         attn_weights = torch.softmax(scores, dim=-1)  # [num_heads, req_num_query_tokens, kv_seq_len]
+                    
+            #         # Compute output: attn_weights @ V
+            #         output = torch.matmul(attn_weights, v_t)  # [num_heads, req_num_query_tokens, v_head_dim]
+            #         output = output.transpose(0, 1)  # [req_num_query_tokens, num_heads, v_head_dim]
+            #         outputs.append(output)
+                
+            #     # Concatenate outputs from all requests
+            #     eager_output = torch.cat(outputs, dim=0)  # [num_tokens, num_heads, v_head_dim]
+            #     return eager_output
+            
+            # attn_output_eager_causal = eager_attention_forward_causal()
+            # attn_output_eager_noncausal = eager_attention_forward_noncausal()
+            
+            self.paged_attention_fwd_causal(
                 query,
                 k_cache,
                 v_cache,
@@ -185,6 +414,20 @@ class TritonAttentionImpl(AttentionImpl[TritonAttentionMetadata]):
                 logit_softcapping=self.logit_softcapping,
                 sinks=learnable_sink,
             )
+            # Validate correctness
+            # similarity_causal = torch.cosine_similarity(
+            #     attn_output_causal.view(-1),
+            #     attn_output_eager_causal.view(-1),
+            #     dim=0,
+            #     eps=1e-6,
+            # )
+            # similarity_noncausal = torch.cosine_similarity(
+            #     attn_output_causal.view(-1),
+            #     attn_output_eager_noncausal.view(-1),
+            #     dim=0,
+            #     eps=1e-6,
+            # )
+            # print(f'TritonAttentionImpl decoding causal similarity: {similarity_causal.item()}, noncausal similarity: {similarity_noncausal.item()}')
         else:
             BLOCK_BS = k_cache.size(1)
             # pad one more block to avoid invalid kv visit

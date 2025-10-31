@@ -522,6 +522,196 @@ def _get_split_k(device_idx: int, head_grid: int, batch_size: int):
     return SPLIT_K
 
 
+@triton.jit
+def _fwd_grouped_split_kernel_causal(
+    Q,
+    K,
+    V,
+    sm_scale,
+    KV_seqlens,
+    Block_offsets,
+    Acc_out,
+    stride_qbs: tl.constexpr,
+    stride_qh: tl.constexpr,
+    stride_qd: tl.constexpr,
+    stride_kp: tl.constexpr,
+    stride_kbs: tl.constexpr,
+    stride_kh: tl.constexpr,
+    stride_kd: tl.constexpr,
+    stride_vp: tl.constexpr,
+    stride_vbs: tl.constexpr,
+    stride_vh: tl.constexpr,
+    stride_vd: tl.constexpr,
+    stride_ok: tl.constexpr,
+    stride_obs: tl.constexpr,
+    stride_oh: tl.constexpr,
+    stride_od: tl.constexpr,
+    stride_boffb,
+    kv_group_num: tl.constexpr,
+    seq_len: tl.constexpr,
+    window_size: tl.constexpr,
+    head_size: tl.constexpr,
+    head_size_v: tl.constexpr,
+    num_heads_q: tl.constexpr,
+    logit_softcapping: tl.constexpr,
+    shared_kv: tl.constexpr,
+    SPLIT_K: tl.constexpr,
+    BLOCK_DMODEL: tl.constexpr,
+    BLOCK_DV: tl.constexpr,
+    BLOCK_N: tl.constexpr,
+    BLOCK_H: tl.constexpr,
+    BLOCK_DMODEL1: tl.constexpr,
+):
+    """First step kernel of split k attention with causal masking."""
+    cur_batch = tl.program_id(2)
+    tile_id = tl.program_id(0)
+    split_k_id = tl.program_id(1)
+
+    HEADS_PER_REQ: tl.constexpr = kv_group_num * seq_len
+    TILES_PER_GROUP: tl.constexpr = tl.cdiv(HEADS_PER_REQ, BLOCK_H)
+    subtile_id = tile_id % TILES_PER_GROUP
+    cur_kv_head = tile_id // TILES_PER_GROUP
+    offs_h = subtile_id * BLOCK_H + tl.arange(0, BLOCK_H)
+    cur_head = cur_kv_head * kv_group_num + offs_h % kv_group_num
+    cur_token = cur_batch * seq_len + offs_h // kv_group_num
+
+    mask_h = cur_head < cur_kv_head * kv_group_num + kv_group_num
+    mask_h = mask_h & (cur_token < cur_batch * seq_len + seq_len)
+    mask_h = mask_h & (cur_head < num_heads_q)
+
+    q_seqlen = seq_len
+    kv_seqlen = tl.load(KV_seqlens + cur_batch)
+    if kv_seqlen <= 0:
+        return
+    history_len = kv_seqlen - q_seqlen
+
+    # initialize offsets
+    offs_n = tl.arange(0, BLOCK_N)
+    offs_d = tl.arange(0, BLOCK_DMODEL)
+    mask_d = offs_d < head_size
+    offs_d = offs_d % head_size
+    offs_dv = tl.arange(0, BLOCK_DV)
+    mask_dv = offs_dv < head_size_v
+    offs_dv = offs_dv % head_size_v
+    off_k = (cur_kv_head * stride_kh + offs_d[:, None] * stride_kd + offs_n[None, :] * stride_kbs)
+    off_v = (cur_kv_head * stride_vh + offs_dv[None, :] * stride_vd + offs_n[:, None] * stride_vbs)
+
+    off_q = (cur_token[:, None] * stride_qbs + cur_head[:, None] * stride_qh + offs_d[None, :] * stride_qd)
+    q = tl.load(Q + off_q, mask=mask_h[:, None] & mask_d[None, :], other=0)
+
+    k_ptrs = K + off_k
+    v_ptrs = V + off_v
+
+    if BLOCK_DMODEL1 != 0:
+        offs_d1 = BLOCK_DMODEL + tl.arange(0, BLOCK_DMODEL1)
+        mask_d1 = offs_d1 < head_size
+        offs_d1 = offs_d1 % head_size
+        off_q1 = (cur_token[:, None] * stride_qbs + cur_head[:, None] * stride_qh + offs_d1[None, :] * stride_qd)
+        q1 = tl.load(Q + off_q1, mask=mask_h[:, None] & mask_d1[None, :], other=0)
+        off_k1 = (cur_kv_head * stride_kh + offs_d1[:, None] * stride_kd + offs_n[None, :] * stride_kbs)
+        k1_ptrs = K + off_k1
+
+    block_offset_ptrs = Block_offsets + cur_batch * stride_boffb
+
+    # initialize pointer to m and l
+    m_i = tl.zeros([BLOCK_H], dtype=tl.float32) - float('inf')
+    l_i = tl.zeros([BLOCK_H], dtype=tl.float32)
+    acc = tl.zeros([BLOCK_H, BLOCK_DV], dtype=tl.float32)
+
+    num_total_blocks = tl.cdiv(kv_seqlen, BLOCK_N)
+    BLOCK_PER_CTA = tl.cdiv(num_total_blocks, SPLIT_K)
+    kv_len_per_prog = BLOCK_PER_CTA * BLOCK_N
+    loop_start = kv_len_per_prog * split_k_id
+    loop_end = tl.minimum(loop_start + kv_len_per_prog, kv_seqlen)
+
+    # load block offset
+    # dirty
+    start_block_id = loop_start // BLOCK_N
+    if window_size > 0:
+        start_block_id = tl.maximum(history_len - window_size, loop_start) // BLOCK_N
+        kv_min_loc = tl.maximum(history_len - window_size, 0)
+
+    loop_start = start_block_id * BLOCK_N
+    block_offset_ptrs += start_block_id
+    
+    # Get token position within sequence for causal masking
+    token_pos_in_seq = offs_h // kv_group_num  # position within the current sequence (0 to seq_len-1)
+    
+    for start_n in range(loop_start, loop_end, BLOCK_N):
+        start_n = tl.multiple_of(start_n, BLOCK_N)
+        b_offset = tl.load(block_offset_ptrs)
+        block_offset_ptrs += 1
+
+        # -- compute qk ----
+        k = tl.load(k_ptrs + b_offset * stride_kp)
+        if BLOCK_DMODEL1 != 0:
+            k1 = tl.load(k1_ptrs + b_offset * stride_kp)
+
+        if shared_kv:
+            v = k.trans(1, 0)
+        else:
+            v = tl.load(v_ptrs + b_offset * stride_vp)
+
+        qk = tl.zeros([BLOCK_H, BLOCK_N], dtype=tl.float32)
+        qk += tl.dot(q, k)
+        if BLOCK_DMODEL1 != 0:
+            qk += tl.dot(q1, k1)
+        qk *= sm_scale
+        if logit_softcapping > 0.0:
+            qk = qk / logit_softcapping
+            qk = tanh(qk)
+            qk = qk * logit_softcapping
+        qk = qk * tl_log2(math.e)
+        
+        # Apply causal mask for tokens within current sequence
+        # For tokens in history (< history_len), all queries can attend
+        # For tokens in current sequence (>= history_len), apply causal mask
+        qk_mask = (start_n + offs_n) < kv_seqlen  # Basic validity mask
+        
+        if window_size > 0:
+            qk_mask = qk_mask & ((start_n + offs_n) >= kv_min_loc)
+        
+        # Causal mask: query at position i can only attend to keys at position <= history_len + i
+        # token_pos_in_seq[h] is the position of query token in current sequence (0 to seq_len-1)
+        # (start_n + offs_n[n]) is the absolute position of key token in kv cache
+        # For causal attention: key_pos <= history_len + query_pos_in_seq
+        causal_mask = (start_n + offs_n[None, :]) <= (history_len + token_pos_in_seq[:, None])
+        qk_mask = qk_mask & causal_mask
+        
+        qk = tl.where(
+            qk_mask,
+            qk,
+            -float('inf'),
+        )
+
+        # -- compute p, m_i and l_i
+        m_i_new = tl.maximum(m_i, tl.max(qk, 1))
+        p = tl_exp2(qk - m_i_new[:, None])
+        alpha = tl_exp2(m_i - m_i_new)
+        l_i_new = alpha * l_i + tl.sum(p, 1)
+
+        # -- update output accumulator --
+        # scale acc
+        acc = acc * alpha[:, None]
+
+        # update acc
+        p, v = _convert_pv(p, v)
+        acc += tl.dot(p, v)
+        # update m_i and l_i
+        l_i = l_i_new
+        m_i = m_i_new
+
+    # initialize pointers to output
+    if loop_end > loop_start:
+        off_acc = (cur_token[:, None] * stride_obs + split_k_id * stride_ok + cur_head[:, None] * stride_oh +
+                   offs_dv[None, :] * stride_od)
+        tl.store(Acc_out + off_acc, acc, mask=mask_h[:, None] & mask_dv[None, :])
+
+    off_meta = (cur_token * stride_obs + split_k_id * stride_ok + cur_head * stride_oh + head_size_v)
+    tl.store(Acc_out + off_meta, m_i, mask=mask_h)
+    tl.store(Acc_out + off_meta + 1, l_i, mask=mask_h)
+
+
 def paged_attention_fwd(
     q: Tensor,
     k: Tensor,
@@ -726,6 +916,194 @@ def paged_attention_fwd(
                                         BLOCK_DMODEL1=BLOCK_DMODEL1,
                                         num_warps=num_warps,
                                         num_stages=num_stages)
+
+    num_warps = 4
+    grid = (num_tokens, head)
+    if quant_policy == 4:
+        Lv *= 2
+        BLOCK_DV *= 2
+    _reduce_split_kernel[grid](acc,
+                               o,
+                               sinks,
+                               stride_ak=acc.stride(2),
+                               stride_abs=acc.stride(0),
+                               stride_ah=acc.stride(1),
+                               stride_ad=acc.stride(3),
+                               stride_obs=o.stride(0),
+                               stride_oh=o.stride(1),
+                               stride_od=o.stride(2),
+                               SPLIT_K=SPLIT_K,
+                               head_size_v=Lv,
+                               BLOCK_DV=BLOCK_DV,
+                               num_warps=num_warps,
+                               num_stages=1)
+
+
+def paged_attention_fwd_causal(
+    q: Tensor,
+    k: Tensor,
+    v: Tensor,
+    o: Tensor,
+    block_offsets: Tensor,
+    kv_seqlens: Tensor,
+    k_scales_zeros: Tensor = None,
+    v_scales_zeros: Tensor = None,
+    quant_policy: Literal[0, 4, 8] = 0,
+    window_size: int = None,
+    sm_scale: float = None,
+    logit_softcapping: float = None,
+    sinks: Tensor = None,
+    kv_layout: str = 'bshd',
+):
+    """Paged Attention forward with causal masking.
+    
+    This version applies causal attention when a request contains multiple tokens.
+    Each token can only attend to itself and previous tokens within the sequence.
+
+    Args:
+        q (Tensor): Query state.
+        k (Tensor): Key state caches.
+        v (Tensor): Value state caches.
+        o (Tensor): Output state.
+        block_offsets (Tensor): The block offset of key and value.
+        kv_seqlens (Tensor): Key/Value length for each data in batch.
+        k_scales_zeros (Tensor): Scales and zeros for key quantization.
+        v_scales_zeros (Tensor): Scales and zeros for value quantization.
+        quant_policy (Literal[0, 4, 8]): Quantization policy (0=none, 4=4bit, 8=8bit).
+        window_size (int): Sliding window size for attention.
+        sm_scale (float): Scaling factor for softmax.
+        logit_softcapping (float): Logit soft capping value.
+        sinks (Tensor): Attention sink values.
+        kv_layout (str): Layout of KV cache ('bshd' or 'bhsd').
+    """
+
+    global _nv_cap
+    if _nv_cap is None:
+        _nv_cap = torch.cuda.get_device_capability()
+
+    if kv_layout == 'bshd':
+        b_dim, s_dim, h_dim, d_dim = (0, 1, 2, 3)
+    elif kv_layout == 'bhsd':
+        b_dim, s_dim, h_dim, d_dim = (0, 2, 1, 3)
+    else:
+        raise RuntimeError('Unsupported layout.')
+
+    if window_size is None:
+        window_size = -1
+
+    if logit_softcapping is None:
+        logit_softcapping = -1.0
+
+    shared_kv = k.data_ptr() == v.data_ptr()
+
+    def _get_block_d(Lk):
+        """Get block d."""
+        BLOCK_DMODEL = triton.next_power_of_2(Lk)
+        BLOCK_DMODEL1 = 0
+        if BLOCK_DMODEL != Lk:
+            BLOCK_DMODEL = BLOCK_DMODEL // 2
+            BLOCK_DMODEL1 = max(16, triton.next_power_of_2(Lk - BLOCK_DMODEL))
+        BLOCK_DV = triton.next_power_of_2(Lv)
+        return BLOCK_DMODEL, BLOCK_DMODEL1, BLOCK_DV
+
+    # shape constraints
+    Lq, Lk, Lv = q.shape[-1], k.shape[d_dim], v.shape[d_dim]
+    if quant_policy == 4:
+        assert Lq == Lk * 2 and Lv * 2 == o.shape[-1]
+    else:
+        assert Lq == Lk and Lv == o.shape[-1]
+
+    if sm_scale is None:
+        sm_scale = 1.0 / (Lq**0.5)
+    batch, head = kv_seqlens.shape[0], q.shape[-2]
+    num_tokens = q.shape[-3]
+    num_kv_heads = k.shape[h_dim]
+    kv_group_num = head // num_kv_heads
+
+    if sinks is not None:
+        assert sinks.is_contiguous()
+        assert sinks.numel() == head
+
+    BLOCK = k.size(s_dim)
+    assert BLOCK >= 16
+    if Lq > 512 and BLOCK > 32:
+        logger.warning(f'`head_dim={Lq}` and `block_size={BLOCK}` '
+                       'might leads to bad performance. '
+                       'Please reduce `block_size`.')
+
+    valid = num_tokens % batch == 0
+    assert valid, 'we only support decoding paged attention.'
+    seq_len = num_tokens // batch
+
+    BLOCK_DMODEL, BLOCK_DMODEL1, BLOCK_DV = _get_block_d(Lq)
+    HEADS_PER_REQ = kv_group_num * seq_len
+    BLOCK_H = max(16, min(BLOCK, triton.next_power_of_2(HEADS_PER_REQ)))
+    TILES_PER_GROUP = triton.cdiv(HEADS_PER_REQ, BLOCK_H)
+    grid_1 = TILES_PER_GROUP * num_kv_heads
+
+    SPLIT_K = _get_split_k(q.device.index, grid_1, batch)
+
+    if quant_policy != 4:
+        acc = q.new_empty(num_tokens, head, SPLIT_K, Lv + 2, dtype=torch.float32)
+    else:
+        acc = q.new_empty(num_tokens, head, SPLIT_K, o.shape[-1] + 2, dtype=torch.float32)
+
+    grid = (
+        grid_1,
+        SPLIT_K,
+        batch,
+    )
+
+    if _nv_cap[0] < 8:
+        num_warps, num_stages = _kernel_meta_default(BLOCK_DMODEL, BLOCK_H)
+    elif _nv_cap[0] < 9:
+        num_warps, num_stages = _kernel_meta_sm8x(BLOCK_DMODEL, BLOCK_H)
+    else:
+        num_warps, num_stages = _kernel_meta_sm9x(BLOCK_DMODEL, BLOCK_H)
+
+    # Note: Currently only non-quantized version is implemented for causal attention
+    if quant_policy > 0:
+        raise NotImplementedError('Quantized version of causal attention is not yet implemented.')
+    
+    _fwd_grouped_split_kernel_causal[grid](q,
+                                          k,
+                                          v,
+                                          sm_scale,
+                                          kv_seqlens,
+                                          block_offsets,
+                                          acc,
+                                          stride_qbs=q.stride(-3),
+                                          stride_qh=q.stride(-2),
+                                          stride_qd=q.stride(-1),
+                                          stride_kp=k.stride(b_dim),
+                                          stride_kbs=k.stride(s_dim),
+                                          stride_kh=k.stride(h_dim),
+                                          stride_kd=k.stride(d_dim),
+                                          stride_vp=v.stride(b_dim),
+                                          stride_vbs=v.stride(s_dim),
+                                          stride_vh=v.stride(h_dim),
+                                          stride_vd=v.stride(d_dim),
+                                          stride_ok=acc.stride(-2),
+                                          stride_obs=acc.stride(-4),
+                                          stride_oh=acc.stride(-3),
+                                          stride_od=acc.stride(-1),
+                                          stride_boffb=block_offsets.stride(0),
+                                          kv_group_num=kv_group_num,
+                                          seq_len=seq_len,
+                                          window_size=window_size,
+                                          head_size=Lk,
+                                          head_size_v=Lv,
+                                          num_heads_q=head,
+                                          logit_softcapping=logit_softcapping,
+                                          shared_kv=shared_kv,
+                                          SPLIT_K=SPLIT_K,
+                                          BLOCK_DMODEL=BLOCK_DMODEL,
+                                          BLOCK_DV=BLOCK_DV,
+                                          BLOCK_N=BLOCK,
+                                          BLOCK_H=BLOCK_H,
+                                          BLOCK_DMODEL1=BLOCK_DMODEL1,
+                                          num_warps=num_warps,
+                                          num_stages=num_stages)
 
     num_warps = 4
     grid = (num_tokens, head)
