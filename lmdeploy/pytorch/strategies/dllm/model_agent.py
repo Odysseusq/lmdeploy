@@ -139,6 +139,33 @@ class DLLMModelAgentStrategy(ModelAgentStrategy):
 
         return next_token_ids.flatten(), dllm_mask.flatten(), seqlens
 
+    def _update_dllm_ntp(self, input_ids: torch.Tensor, next_token_ids: torch.Tensor, dllm_mask: torch.Tensor, seqlens: torch.Tensor):
+        """Update token_ids and dllm_mask."""
+        dllm_mask_token = self.dllm_mask_token
+        dllm_block_length = self.block_size
+
+        # reshape to (batch, dllm_block_length)
+        input_ids = input_ids.view(-1, dllm_block_length).clone()
+        next_token_ids_orig = next_token_ids.view(-1, dllm_block_length).clone()
+        next_token_ids = next_token_ids.view(-1, dllm_block_length).clone()
+        dllm_mask = dllm_mask.view(-1, dllm_block_length).clone()
+
+        next_token_ids = torch.cat([input_ids[:, 0:1], next_token_ids[:, :-1]], dim=1)
+
+        # flags
+        is_cached = (dllm_mask == consts.DLLM_CACHED).all(dim=1)
+
+        is_masked = (dllm_mask == consts.DLLM_MASKED)
+        next_token_ids[is_masked] = dllm_mask_token
+        next_token_ids[is_cached, 0] = next_token_ids_orig[is_cached, -1]
+        next_token_ids[is_cached, 1:] = dllm_mask_token
+        dllm_mask[is_cached, 0] = consts.DLLM_UNMASKED
+        dllm_mask[is_cached, 1:] = consts.DLLM_MASKED
+
+        seqlens = torch.where(is_cached.view(-1), seqlens, seqlens.new_zeros((1, )))
+
+        return next_token_ids.flatten(), dllm_mask.flatten(), seqlens
+
     def slice_outputs(self, inputs: torch.Tensor, seq_length: torch.LongTensor) -> torch.Tensor:
         """Slice outputs."""
         block_length = self.block_size
@@ -204,7 +231,16 @@ class DLLMModelAgentStrategy(ModelAgentStrategy):
         model_inputs.model_metas = model_metas
         dllm_mask = extra_inputs.dllm_mask
 
-        next_token_ids, dllm_mask, step_seqlens = self._update_dllm(next_token_ids, dllm_mask, model_inputs.seq_length)
+        # print(f"input_ids: {model_inputs.input_ids}")
+        # print(f"next_token_ids before updating: {next_token_ids}")
+        # print(f"dllm_mask before updating: {dllm_mask}")
+        next_token_ids, dllm_mask, step_seqlens = self._update_dllm_ntp(model_inputs.input_ids, next_token_ids, dllm_mask, model_inputs.seq_length)
+        # next_token_ids, dllm_mask, step_seqlens = self._update_dllm(next_token_ids, dllm_mask, model_inputs.seq_length)
+        # print(f"next_token_ids after updating: {next_token_ids}")
+        # print(f"dllm_mask after updating: {dllm_mask}")
+        # print(f"mock_next_token_ids after updating: {mock_next_token_ids}")
+        # print(f"mock_dllm_mask after updating: {mock_dllm_mask}")
+        # print()
         model_inputs.step(next_token_ids, step_seqlens)
         self._step_sampling_inputs(sampling_inputs, next_token_ids, dllm_mask=dllm_mask)
 
@@ -214,6 +250,7 @@ class DLLMModelAgentStrategy(ModelAgentStrategy):
     def post_sampling(self, inputs: 'ModelInputs', logits: torch.Tensor, next_token_ids: torch.LongTensor,
                       extra_inputs: DLLMExtraInputs):
         """Post sampling."""
+        print(f"post_sampling called, {inputs.is_decoding=}")
         dllm_mask = extra_inputs.dllm_mask
         input_ids = inputs.input_ids
         input_ids = self.slice_outputs(input_ids.flatten(), inputs.seq_length)

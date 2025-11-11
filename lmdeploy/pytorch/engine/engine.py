@@ -910,6 +910,7 @@ class Engine(EngineBase):
         return_logits = __need_logits(running)
         extra_inputs = self.model_agent_strategy.make_extra_inputs(running)
         stopping_criteria = self.model_agent_strategy.make_stopping_criteria(running)
+        print(f"inputs: {inputs.input_ids}, extra_inputs: {extra_inputs}")
 
         sync_long_context = inputs.input_ids.numel() > self.cache_config.max_prefill_token_num
         return dict(
