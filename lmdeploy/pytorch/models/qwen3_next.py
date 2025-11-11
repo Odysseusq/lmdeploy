@@ -22,7 +22,7 @@ from .utils.cudagraph import CudaGraphMeta, CudaGraphMixin
 class Qwen3NextAttention(nn.Module):
     """Rewrite module of Qwen3MoeAttention."""
 
-    def __init__(self, config: PretrainedConfig, dtype: torch.dtype = None, device: torch.device = None):
+    def __init__(self, config: PretrainedConfig, layer_idx: int, dtype: torch.dtype = None, device: torch.device = None):
         super().__init__()
         quantization_config = getattr(config, 'quantization_config', None)
         num_heads = config.num_attention_heads
@@ -50,11 +50,25 @@ class Qwen3NextAttention(nn.Module):
         self.apply_rotary_pos_emb = ApplyRotaryEmb()
 
         # attention
+        if not hasattr(config, 'dllm_block_length'):
+            import os
+            dllm_block_length = os.getenv('DLLM_BLOCK_LENGTH')
+            if dllm_block_length is not None:
+                dllm_block_length = int(dllm_block_length)
+                if layer_idx == 0:
+                    print(f"Warning: 'dllm_block_length' not found in config, using environment variable value {dllm_block_length}")
+            else:
+                dllm_block_length = 4
+                if layer_idx == 0:
+                    print("Warning: 'dllm_block_length' not found in config, defaulting to 4")
+        else:
+            dllm_block_length = config.dllm_block_length
         self.attn_fwd = Attention(
             num_heads,
             head_dim,
             num_kv_heads=num_key_value_heads,
             v_head_size=head_dim,
+            block_sparse_size=dllm_block_length,
         )
 
         # o_proj
@@ -273,7 +287,7 @@ class Qwen3NextDecoderLayer(nn.Module):
         # build attention layer
         self.layer_type = config.layer_types[layer_idx]
         assert self.layer_type == 'full_attention', "gdn not supported yet"
-        self.self_attn = Qwen3NextAttention(config, dtype=dtype, device=device)
+        self.self_attn = Qwen3NextAttention(config, layer_idx=layer_idx, dtype=dtype, device=device)
 
         # build MLP
         if (layer_idx not in config.mlp_only_layers) and (config.num_experts
