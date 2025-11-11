@@ -88,47 +88,6 @@ class UnmaskingProcessor:
     @record_function('unmasking')
     def __call__(self, logits: torch.Tensor, input_ids: torch.Tensor, token_ids: torch.Tensor, dllm_mask: torch.Tensor):
         """call."""
-        # print(f"input_ids: {input_ids}")
-        # print(f"token_ids: {token_ids}")
-        # print(f"dllm_mask: {dllm_mask}")
-        ref_dllm_mask, ref_token_ids = self.ref_impl(logits.clone(), input_ids.clone(), token_ids.clone(), dllm_mask.clone())
-        strategy = self.dllm_config.unmasking_strategy
-        if strategy is None:
-            return dllm_mask
-
-        # reshape to [num_blocks, block_size]
-        block_size = self.dllm_config.block_length
-        dllm_mask = dllm_mask.unflatten(0, (-1, block_size))
-
-        is_same = (dllm_mask == dllm_mask[:, :1]).all(dim=1)
-        first_mask = dllm_mask[:, 0]
-
-        # unmasked to cache
-        is_block_unmasked = is_same & (first_mask == DLLM_UNMASKED)
-        dllm_mask[is_block_unmasked] = DLLM_CACHED
-
-        dllm_mask = dllm_mask.flatten()
-        token_ids = torch.where(dllm_mask != DLLM_MASKED, input_ids, token_ids)
-        if strategy == UnmaskingStrategy.LOW_CONFIDENCE_STATIC:
-            dllm_mask = self.low_confidence_static(logits, token_ids, dllm_mask)
-        elif strategy == UnmaskingStrategy.LOW_CONFIDENCE_DYNAMIC:
-            dllm_mask = self.low_confidence_dynamic(logits, token_ids, dllm_mask)
-        elif strategy == UnmaskingStrategy.SEQUENTIAL:
-            dllm_mask = self.sequential(dllm_mask)
-        else:
-            raise RuntimeError(f'strategy {strategy} not supported.')
-
-        # print(f"real dllm_mask: {dllm_mask}")
-        # print(f"ref dllm_mask: {ref_dllm_mask}")
-        # print(f"real token_ids: {token_ids}")
-        # print(f"ref token_ids: {ref_token_ids}")
-        # print()
-
-        # return dllm_mask, token_ids
-        return ref_dllm_mask, ref_token_ids
-
-    def ref_impl(self, logits: torch.Tensor, input_ids: torch.Tensor, token_ids: torch.Tensor, dllm_mask: torch.Tensor):
-        """Substitute the output token_ids from unmasked input_ids, and unmask the output to prepare for next step dllm_mask."""
         strategy = self.dllm_config.unmasking_strategy
         if strategy is None:
             return dllm_mask

@@ -97,11 +97,8 @@ class SchedulerSequenceDLLM(SchedulerSequenceDefault):
         last_token = self.history_cache[-dllm_block_length-1]
         input_ids = np.concatenate(([last_token], token_ids[:-1]), axis=0)
         input_ids[dllm_mask == DLLM_MASKED] = dllm_mask_token
-        print(f"Decode input_ids: {input_ids}")
-        print(f"Sliced history_cache before update: {self.history_cache[num_history_ids-1:-1]}")
         self.history_cache[num_history_ids-1:-1] = input_ids
         self.history_dllm_mask[num_history_ids-1:-1] = dllm_mask
-        print(f"Sliced history_cache after update: {self.history_cache[num_history_ids-1:-1]}")
 
         # check if all blocks are cached
         is_unmasked = np.all(dllm_mask == DLLM_UNMASKED)
@@ -127,7 +124,6 @@ class SchedulerSequenceDLLM(SchedulerSequenceDefault):
     def _update_token_ids_prefill(self, token_ids: np.ndarray, dllm_mask: np.ndarray):
         """Update token ids for prefill."""
         dllm_block_length = self.dllm_block_length
-        num_history_ids = self.num_history_ids
         dllm_mask_token = self.dllm_mask_token
 
         new_token_ids = np.full_like(token_ids, dllm_mask_token, shape=(dllm_block_length + 1, ))
@@ -163,18 +159,12 @@ class SchedulerSequenceDLLM(SchedulerSequenceDefault):
             dllm_mask = np.full_like(token_ids, DLLM_UNMASKED, dtype=DLLM_MASK_DTYPE)
         dllm_mask: np.ndarray = _to_ndarray(dllm_mask)
 
-        print(f"Updating token ids: mode={mode}, token_ids={token_ids}, dllm_mask={dllm_mask}")
-        print(f"Before update: num_history_ids={self.num_history_ids}, num_token_ids={self.num_token_ids}, num_valid_ids={self.num_valid_ids}, num_new_tokens={self.num_new_tokens}")
-
         if mode == UpdateTokenMode.INPUTS:
             self._update_token_ids_inputs(token_ids, dllm_mask)
         elif mode == UpdateTokenMode.PREFILL:
             self._update_token_ids_prefill(token_ids, dllm_mask)
         else:
             self._update_token_ids_decode(token_ids, dllm_mask)
-        print(f"After update: num_history_ids={self.num_history_ids}, num_token_ids={self.num_token_ids}, num_valid_ids={self.num_valid_ids}, num_new_tokens={self.num_new_tokens}")
-        print(f"History cache: {self.history_cache._token_ids[:self.num_valid_ids+self.dllm_block_length]}")
-        print()
 
         if model_meta is not None:
             self.model_meta = model_meta
